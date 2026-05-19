@@ -1,5 +1,29 @@
 import torch
 from torch.nn.functional import softplus, gumbel_softmax, softmax
+from contextlib import contextmanager
+from threading import RLock
+
+
+_TORCH_SEED_LOCK = RLock()
+
+
+@contextmanager
+def local_torch_seed(seed: int = None):
+    """
+    Temporarily seed PyTorch without leaking RNG state to callers.
+
+    Some torch.distributions sampling APIs do not accept a ``Generator`` argument,
+    so this helper contains the unavoidable global seed mutation inside
+    ``torch.random.fork_rng`` and restores the caller's RNG state afterwards.
+    """
+    if seed is None:
+        yield
+        return
+
+    with _TORCH_SEED_LOCK:
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(int(seed))
+            yield
 
 def nan_to_num(predt: torch.tensor) -> torch.tensor:
     """
@@ -15,11 +39,8 @@ def nan_to_num(predt: torch.tensor) -> torch.tensor:
     predt: torch.tensor
         Predicted values.
     """
-    predt = torch.nan_to_num(predt,
-                             nan=float(torch.nanmean(predt)),
-                             posinf=float(torch.nanmean(predt)),
-                             neginf=float(torch.nanmean(predt))
-                             )
+    fill = float(torch.nanmean(predt.detach()))
+    predt = torch.nan_to_num(predt, nan=fill, posinf=fill, neginf=fill)
 
     return predt
 
@@ -38,9 +59,7 @@ def identity_fn(predt: torch.tensor) -> torch.tensor:
     predt: torch.tensor
         Predicted values.
     """
-    predt = nan_to_num(predt) + torch.tensor(0, dtype=predt.dtype)
-
-    return predt
+    return nan_to_num(predt)
 
 
 def exp_fn(predt: torch.tensor) -> torch.tensor:
@@ -173,9 +192,7 @@ def softmax_fn(predt: torch.tensor) -> torch.tensor:
     predt: torch.tensor
         Predicted values.
     """
-    predt = softmax(nan_to_num(predt), dim=1) + torch.tensor(0, dtype=predt.dtype)
-
-    return predt
+    return softmax(nan_to_num(predt), dim=1)
 
 
 def gumbel_softmax_fn(predt: torch.tensor,
@@ -213,8 +230,5 @@ def gumbel_softmax_fn(predt: torch.tensor,
     predt: torch.tensor
         Predicted values.
     """
-    torch.manual_seed(123)
-    predt = gumbel_softmax(nan_to_num(predt), tau=tau, dim=1) + torch.tensor(0, dtype=predt.dtype)
-
-
-    return predt
+    with local_torch_seed(123):
+        return gumbel_softmax(nan_to_num(predt), tau=tau, dim=1)

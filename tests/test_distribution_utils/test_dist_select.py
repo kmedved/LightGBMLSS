@@ -21,6 +21,7 @@ from lightgbmlss.distributions.mixture_distribution_utils import MixtureDistribu
 
 import numpy as np
 import pandas as pd
+import torch
 
 
 class TestClass(BaseTestClass):
@@ -44,6 +45,19 @@ class TestClass(BaseTestClass):
         assert np.issubdtype(dist_df["nll"].dtype, np.float64)
         assert not np.isnan(dist_df["nll"].values).any()
         assert not np.isinf(dist_df["nll"].values).any()
+
+    def test_univar_dist_select_parallel_matches_serial(self):
+        target = np.array([0.2, 0.4, 0.6, 0.8]).reshape(-1, 1)
+        candidate_distributions = [Gaussian, Laplace]
+
+        serial_df = univariate_dist_class().dist_select(
+            target, candidate_distributions, plot=False, max_iter=2, n_jobs=1
+        ).reset_index(drop=True)
+        parallel_df = univariate_dist_class().dist_select(
+            target, candidate_distributions, plot=False, max_iter=2, n_jobs=2
+        ).reset_index(drop=True)
+
+        pd.testing.assert_frame_equal(serial_df, parallel_df)
 
     @pytest.mark.skipif(
         not _check_soft_dependencies(["matplotlib", "seaborn"], severity="none"),
@@ -93,6 +107,28 @@ class TestClass(BaseTestClass):
         assert np.issubdtype(dist_df["nll"].dtype, np.float64)
         assert not np.isnan(dist_df["nll"].values).any()
         assert not np.isinf(dist_df["nll"].values).any()
+
+    def test_flow_select_parallel_matches_serial(self):
+        target = np.array([0.2, 0.4, 0.6, 0.8]).reshape(-1, 1)
+        bound = np.max([np.abs(target.min()), target.max()])
+        target_support = "real"
+
+        candidate_flows = [
+            SplineFlow(target_support=target_support, count_bins=2, bound=bound, order="linear"),
+            SplineFlow(target_support=target_support, count_bins=2, bound=bound, order="quadratic")
+        ]
+
+        serial_df = flow_dist_class().flow_select(
+            target, candidate_flows, plot=False, max_iter=2, n_jobs=1
+        ).reset_index(drop=True)
+        torch.manual_seed(2024)
+        rng_state = torch.random.get_rng_state()
+        parallel_df = flow_dist_class().flow_select(
+            target, candidate_flows, plot=False, max_iter=2, n_jobs=2
+        ).reset_index(drop=True)
+
+        pd.testing.assert_frame_equal(serial_df, parallel_df)
+        assert torch.equal(torch.random.get_rng_state(), rng_state)
 
     @pytest.mark.skipif(
         not _check_soft_dependencies(["matplotlib", "seaborn"], severity="none"),
@@ -152,6 +188,25 @@ class TestClass(BaseTestClass):
         assert np.issubdtype(dist_df["nll"].dtype, np.float64)
         assert not np.isnan(dist_df["nll"].values).any()
         assert not np.isinf(dist_df["nll"].values).any()
+
+    def test_mixture_dist_select_parallel_matches_serial(self):
+        target = np.array([0.2, 0.4, 0.6, 0.8]).reshape(-1, 1)
+        candidate_distributions = [
+            Mixture(Gaussian.Gaussian()),
+            Mixture(Laplace.Laplace())
+        ]
+
+        serial_df = mixture_dist_class().dist_select(
+            target, candidate_distributions, plot=False, max_iter=2, n_jobs=1
+        ).reset_index(drop=True)
+        torch.manual_seed(2024)
+        rng_state = torch.random.get_rng_state()
+        parallel_df = mixture_dist_class().dist_select(
+            target, candidate_distributions, plot=False, max_iter=2, n_jobs=2
+        ).reset_index(drop=True)
+
+        pd.testing.assert_frame_equal(serial_df, parallel_df)
+        assert torch.equal(torch.random.get_rng_state(), rng_state)
 
     @pytest.mark.skipif(
         not _check_soft_dependencies(["matplotlib", "seaborn"], severity="none"),

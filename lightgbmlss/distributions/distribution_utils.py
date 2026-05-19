@@ -7,9 +7,52 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from joblib import Parallel, delayed
 
 from typing import Any, Dict, Optional, List, Tuple
 import warnings
+
+from lightgbmlss.utils import local_torch_seed
+
+
+def _sample_array_to_frame(samples: np.ndarray, discrete: bool = False) -> pd.DataFrame:
+    samples_df = pd.DataFrame(samples)
+    samples_df.columns = [str("y_sample") + str(i) for i in range(samples_df.shape[1])]
+    if discrete:
+        samples_df = samples_df.astype(int)
+    return samples_df
+
+
+def _quantile_array_to_frame(samples: np.ndarray, quantiles: List[float], discrete: bool = False) -> pd.DataFrame:
+    pred_quant = np.quantile(samples, quantiles, axis=1).T
+    pred_quant_df = pd.DataFrame(pred_quant)
+    pred_quant_df.columns = [str("quant_") + str(quantiles[i]) for i in range(len(quantiles))]
+    if discrete:
+        pred_quant_df = pred_quant_df.astype(int)
+    return pred_quant_df
+
+
+def _distribution_candidate_name(candidate_distribution) -> str:
+    return candidate_distribution.__name__.split(".")[-1]
+
+
+def _fit_distribution_candidate(candidate_distribution, target, max_iter: int, loss_fn: str) -> Dict[str, Any]:
+    dist_name = _distribution_candidate_name(candidate_distribution)
+    dist_sel = getattr(candidate_distribution, dist_name)()
+    try:
+        loss, params = dist_sel.calculate_start_values(target=target.reshape(-1, 1), max_iter=max_iter)
+        return {
+            loss_fn: float(np.asarray(loss).reshape(-1)[0]),
+            "distribution": str(dist_name),
+            "params": params,
+        }
+    except Exception as e:
+        warnings.warn(f"Error fitting {dist_name} distribution: {str(e)}")
+        return {
+            loss_fn: np.nan,
+            "distribution": str(dist_name),
+            "params": np.array([np.nan]),
+        }
 
 
 class DistributionClass:
@@ -162,8 +205,8 @@ class DistributionClass:
             Loss value.
         """
         # Replace NaNs and infinity values with 0.5
-        nan_inf_idx = torch.isnan(torch.stack(params)) | torch.isinf(torch.stack(params))
-        params = torch.where(nan_inf_idx, torch.tensor(0.5), torch.stack(params))
+        stacked = torch.stack(params)
+        params = torch.where(torch.isnan(stacked) | torch.isinf(stacked), torch.tensor(0.5), stacked)
 
         # Transform parameters to response scale
         params = [
@@ -289,9 +332,12 @@ class DistributionClass:
             if self.loss_fn == "nll":
                 loss = -torch.nansum(dist_fit.log_prob(target))
             elif self.loss_fn == "crps":
-                torch.manual_seed(123)
-                dist_samples = dist_fit.rsample((30,)).squeeze(-1)
-                loss = torch.nansum(self.crps_score(target, dist_samples))
+                crps_loss = self.crps_loss(predt_transformed, target)
+                if crps_loss is None:
+                    with local_torch_seed(123):
+                        dist_samples = dist_fit.rsample((30,)).squeeze(-1)
+                    crps_loss = self.crps_score(target, dist_samples)
+                loss = torch.nansum(crps_loss)
             else:
                 raise ValueError("Invalid loss function. Please select 'nll' or 'crps'.")
         else:
@@ -299,6 +345,67 @@ class DistributionClass:
             loss = -torch.nansum(dist_fit.log_prob(target, self.tau))
 
         return predt, loss
+
+    def crps_loss(self,
+                  predt_transformed: List[torch.Tensor],
+                  target: torch.Tensor
+                  ) -> Optional[torch.Tensor]:
+        """
+        Analytic CRPS contribution for distributions with closed-form support.
+
+        Subclasses can override this method and return one CRPS value per
+        observation. Returning ``None`` keeps the existing sample-based CRPS
+        fallback.
+        """
+        return None
+
+    def _predict_param_array(self,
+                             booster: lgb.Booster,
+                             data: pd.DataFrame,
+                             start_values: np.ndarray,
+                             ) -> np.ndarray:
+        predt = torch.tensor(
+            booster.predict(data, raw_score=True),
+            dtype=torch.float32
+        ).reshape(-1, self.n_dist_param)
+
+        init_score_pred = torch.tensor(
+            np.ones(shape=(data.shape[0], 1)) * start_values,
+            dtype=torch.float32
+        )
+
+        return np.concatenate(
+            [
+                response_fun(
+                    predt[:, i].reshape(-1, 1) + init_score_pred[:, i].reshape(-1, 1)
+                ).detach().numpy()
+                for i, (dist_param, response_fun) in enumerate(self.param_dict.items())
+            ],
+            axis=1,
+        )
+
+    def _params_array_to_frame(self, predt_params: np.ndarray) -> pd.DataFrame:
+        predt_df = pd.DataFrame(predt_params)
+        predt_df.columns = self.param_dict.keys()
+        return predt_df
+
+    def _draw_samples_array(self,
+                            predt_params: pd.DataFrame,
+                            n_samples: int = 1000,
+                            seed: int = 123,
+                            ) -> Optional[np.ndarray]:
+        if self.tau is not None:
+            return None
+
+        pred_params = torch.as_tensor(np.asarray(predt_params), dtype=torch.float32)
+        dist_kwargs = {arg_name: param for arg_name, param in zip(self.distribution_arg_names, pred_params.T)}
+        dist_pred = self.distribution(**dist_kwargs)
+
+        with local_torch_seed(seed):
+            dist_samples = dist_pred.sample((n_samples,)).detach().numpy()
+
+        dist_samples = dist_samples.reshape(n_samples, -1)
+        return dist_samples.T
 
     def draw_samples(self,
                      predt_params: pd.DataFrame,
@@ -323,27 +430,13 @@ class DistributionClass:
             DataFrame with n_samples drawn from predicted response distribution.
 
         """
-        torch.manual_seed(seed)
+        dist_samples = self._draw_samples_array(predt_params=predt_params,
+                                                n_samples=n_samples,
+                                                seed=seed)
+        if dist_samples is None:
+            return None
 
-        if self.tau is None:
-            pred_params = torch.tensor(predt_params.values)
-            dist_kwargs = {arg_name: param for arg_name, param in zip(self.distribution_arg_names, pred_params.T)}
-            dist_pred = self.distribution(**dist_kwargs)
-            # Sample: shape is (n_samples, n_obs, *event_shape)
-            dist_samples = dist_pred.sample((n_samples,)).detach().numpy()
-            # Flatten any event dimensions but keep (n_samples, n_obs) as outer structure
-            dist_samples = dist_samples.reshape(n_samples, -1)  # (n_samples, n_obs)
-            dist_samples = dist_samples.T  # (n_obs, n_samples)
-
-            dist_samples = pd.DataFrame(dist_samples)
-            dist_samples.columns = [str("y_sample") + str(i) for i in range(dist_samples.shape[1])]
-        else:
-            dist_samples = None
-
-        if self.discrete:
-            dist_samples = dist_samples.astype(int)
-
-        return dist_samples
+        return _sample_array_to_frame(dist_samples, discrete=self.discrete)
 
     def predict_dist(self,
                      booster: lgb.Booster,
@@ -384,51 +477,24 @@ class DistributionClass:
             Predictions.
         """
 
-        predt = torch.tensor(
-            booster.predict(data, raw_score=True),
-            dtype=torch.float32
-        ).reshape(-1, self.n_dist_param)
+        dist_params_predt = self._predict_param_array(booster=booster,
+                                                      data=data,
+                                                      start_values=start_values)
 
-        # Set init_score as starting point for each distributional parameter.
-        init_score_pred = torch.tensor(
-            np.ones(shape=(data.shape[0], 1))*start_values,
-            dtype=torch.float32
-        )
+        if pred_type == "parameters" or pred_type == "expectiles":
+            return self._params_array_to_frame(dist_params_predt)
 
-        # The predictions don't include the init_score specified in creating the train data.
-        # Hence, it needs to be added manually with the corresponding transform for each distributional parameter.
-        dist_params_predt = np.concatenate(
-            [
-                response_fun(
-                    predt[:, i].reshape(-1, 1) + init_score_pred[:, i].reshape(-1, 1)).numpy()
-                for i, (dist_param, response_fun) in enumerate(self.param_dict.items())
-            ],
-            axis=1,
-        )
-        dist_params_predt = pd.DataFrame(dist_params_predt)
-        dist_params_predt.columns = self.param_dict.keys()
+        pred_samples = self._draw_samples_array(predt_params=dist_params_predt,
+                                                n_samples=n_samples,
+                                                seed=seed)
+        if pred_samples is None:
+            return None
 
-        # Draw samples from predicted response distribution
-        pred_samples_df = self.draw_samples(predt_params=dist_params_predt,
-                                            n_samples=n_samples,
-                                            seed=seed)
-
-        if pred_type == "parameters":
-            return dist_params_predt
-
-        elif pred_type == "expectiles":
-            return dist_params_predt
-
-        elif pred_type == "samples":
-            return pred_samples_df
+        if pred_type == "samples":
+            return _sample_array_to_frame(pred_samples, discrete=self.discrete)
 
         elif pred_type == "quantiles":
-            # Calculate quantiles from predicted response distribution
-            pred_quant_df = pred_samples_df.quantile(quantiles, axis=1).T
-            pred_quant_df.columns = [str("quant_") + str(quantiles[i]) for i in range(len(quantiles))]
-            if self.discrete:
-                pred_quant_df = pred_quant_df.astype(int)
-            return pred_quant_df
+            return _quantile_array_to_frame(pred_samples, quantiles, discrete=self.discrete)
 
     def compute_gradients_and_hessians(self,
                                        loss: torch.tensor,
@@ -533,23 +599,23 @@ class DistributionClass:
             Stabilized Gradient or Hessian.
         """
 
+        fill_val = float(torch.nanmean(input_der))
+        input_der = torch.nan_to_num(input_der, nan=fill_val, posinf=fill_val, neginf=fill_val)
+
         if type == "MAD":
-            input_der = torch.nan_to_num(input_der, nan=float(torch.nanmean(input_der)))
             div = torch.nanmedian(torch.abs(input_der - torch.nanmedian(input_der)))
-            div = torch.where(div < torch.tensor(1e-04), torch.tensor(1e-04), div)
-            stab_der = input_der / div
+            div = div.clamp(min=1e-04)
+            return input_der / div
 
         if type == "L2":
-            input_der = torch.nan_to_num(input_der, nan=float(torch.nanmean(input_der)))
             div = torch.sqrt(torch.nanmean(input_der.pow(2)))
-            div = torch.where(div < torch.tensor(1e-04), torch.tensor(1e-04), div)
-            div = torch.where(div > torch.tensor(10000.0), torch.tensor(10000.0), div)
-            stab_der = input_der / div
+            div = div.clamp(min=1e-04, max=10000.0)
+            return input_der / div
 
         if type == "None":
-            stab_der = torch.nan_to_num(input_der, nan=float(torch.nanmean(input_der)))
+            return input_der
 
-        return stab_der
+        raise ValueError("Invalid stabilization method. Select 'None', 'MAD', or 'L2'.")
 
     def crps_score(self, y: torch.tensor, yhat_dist: torch.tensor) -> torch.tensor:
         """
@@ -576,34 +642,20 @@ class DistributionClass:
         ------
         https://github.com/elephaint/pgbm/blob/main/pgbm/torch/pgbm_dist.py#L549
         """
-        # Get the number of observations
         n_samples = yhat_dist.shape[0]
+        yhat_dist = yhat_dist.reshape(n_samples, -1)
+        yhat_sorted, _ = torch.sort(yhat_dist, 0)
+        y_flat = y.reshape(-1)
 
-        # Sort the forecasts in ascending order
-        yhat_dist_sorted, _ = torch.sort(yhat_dist, 0)
+        # E|X-y|
+        term1 = torch.mean(torch.abs(yhat_sorted - y_flat.unsqueeze(0)), dim=0)
 
-        # Create temporary tensors
-        y_cdf = torch.zeros_like(y)
-        yhat_cdf = torch.zeros_like(y)
-        yhat_prev = torch.zeros_like(y)
-        crps = torch.zeros_like(y)
+        # 0.5 * E|X-X'| via sorted-order identity
+        idx = torch.arange(1, n_samples + 1, dtype=yhat_sorted.dtype, device=yhat_sorted.device)
+        weights = (2 * idx - n_samples - 1).unsqueeze(1)
+        term2 = torch.sum(weights * yhat_sorted, dim=0) / (n_samples * n_samples)
 
-        # Loop over the predicted samples generated per observation
-        for yhat in yhat_dist_sorted:
-            yhat = yhat.reshape(-1, 1)
-            flag = (y_cdf == 0) * (y < yhat)
-            crps += flag * ((y - yhat_prev) * yhat_cdf ** 2)
-            crps += flag * ((yhat - y) * (yhat_cdf - 1) ** 2)
-            crps += (~flag) * ((yhat - yhat_prev) * (yhat_cdf - y_cdf) ** 2)
-            y_cdf += flag
-            yhat_cdf += 1 / n_samples
-            yhat_prev = yhat
-
-        # In case y_cdf == 0 after the loop
-        flag = (y_cdf == 0)
-        crps += flag * (y - yhat)
-
-        return crps
+        return (term1 - term2).reshape(-1, 1)
 
     def dist_select(self,
                     target: np.ndarray,
@@ -611,6 +663,7 @@ class DistributionClass:
                     max_iter: int = 100,
                     plot: bool = False,
                     figure_size: tuple = (10, 5),
+                    n_jobs: int = 1,
                     ) -> pd.DataFrame:
         """
         Function that selects the most suitable distribution among the candidate_distributions for the target variable,
@@ -628,41 +681,35 @@ class DistributionClass:
             If True, a density plot of the actual and fitted distribution is created.
         figure_size: tuple
             Figure size of the density plot.
+        n_jobs: int
+            Number of parallel jobs used to fit candidate distributions.
 
         Returns
         -------
         fit_df: pd.DataFrame
             Dataframe with the loss values of the fitted candidate distributions.
         """
-        dist_list = []
         total_iterations = len(candidate_distributions)
-        with tqdm(total=total_iterations, desc="Fitting candidate distributions") as pbar:
-            for i in range(len(candidate_distributions)):
-                dist_name = candidate_distributions[i].__name__.split(".")[2]
-                pbar.set_description(f"Fitting {dist_name} distribution")
-                dist_sel = getattr(candidate_distributions[i], dist_name)()
-                try:
-                    loss, params = dist_sel.calculate_start_values(target=target.reshape(-1, 1), max_iter=max_iter)
-                    fit_df = pd.DataFrame.from_dict(
-                        {self.loss_fn: loss.reshape(-1,),
-                         "distribution": str(dist_name),
-                         "params": [params]
-                         }
+        if n_jobs == 1:
+            results = []
+            with tqdm(total=total_iterations, desc="Fitting candidate distributions") as pbar:
+                for candidate_distribution in candidate_distributions:
+                    dist_name = _distribution_candidate_name(candidate_distribution)
+                    pbar.set_description(f"Fitting {dist_name} distribution")
+                    results.append(
+                        _fit_distribution_candidate(candidate_distribution, target, max_iter, self.loss_fn)
                     )
-                except Exception as e:
-                    warnings.warn(f"Error fitting {dist_name} distribution: {str(e)}")
-                    fit_df = pd.DataFrame(
-                        {self.loss_fn: np.nan,
-                         "distribution": str(dist_name),
-                         "params": [np.nan] * self.n_dist_param
-                         }
-                    )
-                dist_list.append(fit_df)
-                pbar.update(1)
-            pbar.set_description(f"Fitting of candidate distributions completed")
-            fit_df = pd.concat(dist_list).sort_values(by=self.loss_fn, ascending=True)
-            fit_df["rank"] = fit_df[self.loss_fn].rank().astype(int)
-            fit_df.set_index(fit_df["rank"], inplace=True)
+                    pbar.update(1)
+                pbar.set_description("Fitting of candidate distributions completed")
+        else:
+            results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(_fit_distribution_candidate)(candidate_distribution, target, max_iter, self.loss_fn)
+                for candidate_distribution in candidate_distributions
+            )
+
+        fit_df = pd.DataFrame(results).sort_values(by=self.loss_fn, ascending=True)
+        fit_df["rank"] = fit_df[self.loss_fn].rank().astype(int)
+        fit_df.set_index(fit_df["rank"], inplace=True)
 
         if plot:
             from skbase.utils.dependencies import _check_soft_dependencies
