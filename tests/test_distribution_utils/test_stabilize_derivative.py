@@ -1,4 +1,5 @@
 from ..utils import BaseTestClass
+import pytest
 import torch
 
 
@@ -64,3 +65,15 @@ class TestClass(BaseTestClass):
         assert stab_der.shape == input_der.shape
         assert not torch.isnan(stab_der).any()
         assert not torch.isinf(stab_der).any()
+
+    def test_stabilize_derivative_invalid_method_raises(self, dist_class):
+        input_der = torch.rand((10, 1), dtype=torch.float64)
+
+        with pytest.raises(ValueError, match="Invalid stabilization method"):
+            dist_class.dist.stabilize_derivative(input_der, "mad")
+
+    def test_stabilize_derivative_mixture_invalid_method_raises(self, mixture_class):
+        input_der = torch.rand((10, 1), dtype=torch.float64)
+
+        with pytest.raises(ValueError, match="Invalid stabilization method"):
+            mixture_class.dist.stabilize_derivative(input_der, "mad")

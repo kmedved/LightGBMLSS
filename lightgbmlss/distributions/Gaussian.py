@@ -1,6 +1,7 @@
 from torch.distributions import Normal as Gaussian_Torch
 from .distribution_utils import DistributionClass
 from ..utils import *
+import math
 
 
 class Gaussian(DistributionClass):
@@ -73,3 +74,19 @@ class Gaussian(DistributionClass):
                          loss_fn=loss_fn,
                          initialize=initialize,
                          )
+
+    def crps_loss(self, predt_transformed, target):
+        """
+        Closed-form Gaussian CRPS for each observation.
+
+        Formula from Gneiting & Raftery (2007):
+        sigma * {z * [2 Phi(z) - 1] + 2 phi(z) - 1 / sqrt(pi)}.
+        """
+        loc, scale = predt_transformed
+        z = (target - loc) / scale
+        std_normal = Gaussian_Torch(torch.zeros_like(z), torch.ones_like(z))
+        return scale * (
+            z * (2 * std_normal.cdf(z) - 1)
+            + 2 * torch.exp(std_normal.log_prob(z))
+            - 1 / math.sqrt(math.pi)
+        )

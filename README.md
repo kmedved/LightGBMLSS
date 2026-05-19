@@ -61,14 +61,45 @@ For the PyPI version, please use
 pip install lightgbmlss
 ```
 
+## `Quickstart`
+
+```python
+from lightgbmlss.distributions.Gaussian import Gaussian
+from lightgbmlss.model import LightGBMLSS
+import lightgbm as lgb
+import numpy as np
+
+# Create model with Gaussian distribution
+dist = Gaussian(stabilization="None", loss_fn="nll")
+model = LightGBMLSS(dist)
+
+# Prepare data
+dtrain = lgb.Dataset(X_train, label=y_train)
+
+# Train
+params = {"learning_rate": 0.05, "max_depth": 3}
+model.train(params, dtrain, num_boost_round=100)
+
+# Predict full distribution parameters
+pred_params = model.predict(X_test, pred_type="parameters")
+
+# Or draw samples / compute quantiles
+pred_quantiles = model.predict(X_test, pred_type="quantiles", quantiles=[0.1, 0.5, 0.9])
+```
+
 ## `Available Distributions`
 Our framework is built upon PyTorch and Pyro, enabling users to harness a diverse set of distributional families. LightGBMLSS currently supports the [following distributions](https://statmixedml.github.io/LightGBMLSS/distributions/).
 
-## `How to Use`
-Please visit the [example section](https://statmixedml.github.io/LightGBMLSS/examples/Gaussian_Regression/) for guidance on how to use the framework.
-
 ## `Documentation`
-For more information and context, please visit the [documentation](https://statmixedml.github.io/LightGBMLSS/).
+
+| Resource | Description |
+|----------|-------------|
+| [Full Documentation](https://statmixedml.github.io/LightGBMLSS/) | Online docs with examples and API reference |
+| [Architecture](docs/architecture.md) | System design, component diagrams, training/prediction flow |
+| [Development Guide](docs/development.md) | Local setup, running tests, adding distributions |
+| [Troubleshooting](docs/troubleshooting.md) | Common issues and solutions |
+| [Available Distributions](docs/distributions.md) | Complete distribution reference table |
+| [Examples](https://statmixedml.github.io/LightGBMLSS/examples/Gaussian_Regression/) | Jupyter notebook walkthroughs |
 
 ## `Feedback`
 We encourage you to provide feedback on how to enhance LightGBMLSS or request the implementation of additional distributions by opening a [new discussion](https://github.com/StatMixedML/LightGBMLSS/discussions).

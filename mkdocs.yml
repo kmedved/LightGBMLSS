@@ -38,6 +38,7 @@ nav:
   - Home: index.md
   - Distributional Modelling: dgbm.md
   - Available Distributions: distributions.md
+  - Architecture: architecture.md
   - Examples:
     - Basic Walkthrough - Gaussian Regression: examples/Gaussian_Regression.ipynb
     - Expectile Regression: examples/Expectile_Regression.ipynb
@@ -46,5 +47,7 @@ nav:
     - How to Select a Univariate Distribution: examples/How_To_Select_A_Univariate_Distribution.ipynb
     - Spline Flow Regression: examples/SplineFlow_Regression.ipynb
     - Zero-Adjusted Gamma Regression: examples/ZAGamma_Regression.ipynb
+  - Development: development.md
+  - Troubleshooting: troubleshooting.md
   - API Docs:
     - api.md

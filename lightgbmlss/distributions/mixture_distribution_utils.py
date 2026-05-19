@@ -9,9 +9,42 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from joblib import Parallel, delayed
 
 from typing import Any, Dict, Optional, List, Tuple
 import warnings
+
+from lightgbmlss.distributions.distribution_utils import _quantile_array_to_frame, _sample_array_to_frame
+from lightgbmlss.utils import local_torch_seed
+
+
+def _mixture_candidate_name(candidate_distribution) -> str:
+    dist_name = candidate_distribution.distribution.__class__.__name__
+    n_mix = candidate_distribution.M
+    tau = candidate_distribution.temperature
+    return f"Mixture({dist_name}, tau={tau}, M={n_mix})"
+
+
+def _fit_mixture_candidate(candidate_distribution, target, max_iter: int, dist_pos: int) -> Dict[str, Any]:
+    dist_name = _mixture_candidate_name(candidate_distribution)
+    try:
+        loss, params = candidate_distribution.calculate_start_values(target=target, max_iter=max_iter)
+        return {
+            candidate_distribution.loss_fn: float(np.asarray(loss).reshape(-1)[0]),
+            "distribution": str(dist_name),
+            "params": params,
+            "dist_pos": dist_pos,
+            "M": candidate_distribution.M,
+        }
+    except Exception as e:
+        warnings.warn(f"Error fitting {dist_name} distribution: {str(e)}")
+        return {
+            candidate_distribution.loss_fn: np.nan,
+            "distribution": str(dist_name),
+            "params": np.array([np.nan]),
+            "dist_pos": dist_pos,
+            "M": candidate_distribution.M,
+        }
 
 
 def get_component_distributions():
@@ -229,8 +262,8 @@ class MixtureDistributionClass:
             Loss value.
         """
         # Replace NaNs and infinity values with 0.5
-        nan_inf_idx = torch.isnan(torch.stack(params)) | torch.isinf(torch.stack(params))
-        params = torch.where(nan_inf_idx, torch.tensor(0.5), torch.stack(params)).reshape(1, -1)
+        stacked = torch.stack(params)
+        params = torch.where(torch.isnan(stacked) | torch.isinf(stacked), torch.tensor(0.5), stacked).reshape(1, -1)
         params = torch.split(params, self.M, dim=1)
 
         # Transform parameters to response scale
@@ -380,6 +413,53 @@ class MixtureDistributionClass:
 
         return predt, loss
 
+    def _predict_param_array(self,
+                             booster: lgb.Booster,
+                             data: pd.DataFrame,
+                             start_values: np.ndarray,
+                             ) -> np.ndarray:
+        predt = torch.tensor(
+            booster.predict(data, raw_score=True),
+            dtype=torch.float32
+        ).reshape(-1, self.n_dist_param)
+
+        init_score_pred = torch.tensor(
+            np.ones(shape=(data.shape[0], 1)) * start_values,
+            dtype=torch.float32
+        )
+
+        dist_params_predt = torch.split(
+            torch.cat(
+                [
+                    predt[:, i].reshape(-1, 1) + init_score_pred[:, i].reshape(-1, 1)
+                    for i in range(self.n_dist_param)
+                ], axis=1
+            ), self.M, dim=1
+        )
+
+        return np.concatenate(
+            [
+                response_fn(dist_params_predt[i]).detach().numpy()
+                for i, response_fn in enumerate(self.param_dict.values())
+            ],
+            axis=1,
+        )
+
+    def _draw_samples_array(self,
+                            predt_params: pd.DataFrame,
+                            n_samples: int = 1000,
+                            seed: int = 123,
+                            ) -> np.ndarray:
+        pred_params = torch.as_tensor(np.asarray(predt_params), dtype=torch.float32).reshape(-1, self.n_dist_param)
+        pred_params = torch.split(pred_params, self.M, dim=1)
+        dist_pred = self.create_mixture_distribution(pred_params)
+
+        with local_torch_seed(seed):
+            dist_samples = dist_pred.sample((n_samples,)).detach().numpy()
+
+        dist_samples = dist_samples.reshape(n_samples, -1)
+        return dist_samples.T
+
     def draw_samples(self,
                      predt_params: pd.DataFrame,
                      n_samples: int = 1000,
@@ -403,23 +483,10 @@ class MixtureDistributionClass:
             DataFrame with n_samples drawn from predicted response distribution.
 
         """
-        torch.manual_seed(seed)
-
-        pred_params = torch.tensor(predt_params.values).reshape(-1, self.n_dist_param)
-        pred_params = torch.split(pred_params, self.M, dim=1)
-        dist_pred = self.create_mixture_distribution(pred_params)
-        # sample (n_samples, n_obs, *event_shape)
-        dist_samples = dist_pred.sample((n_samples,)).detach().numpy()
-        # Flatten event dims, keep (n_samples, n_obs) as outer shape
-        dist_samples = dist_samples.reshape(n_samples, -1)  # (n_samples, n_obs)
-        dist_samples = dist_samples.T  # (n_obs, n_samples)
-        dist_samples = pd.DataFrame(dist_samples)
-        dist_samples.columns = [str("y_sample") + str(i) for i in range(dist_samples.shape[1])]
-
-        if self.discrete:
-            dist_samples = dist_samples.astype(int)
-
-        return dist_samples
+        dist_samples = self._draw_samples_array(predt_params=predt_params,
+                                                n_samples=n_samples,
+                                                seed=seed)
+        return _sample_array_to_frame(dist_samples, discrete=self.discrete)
 
     def predict_dist(self,
                      booster: lgb.Booster,
@@ -458,57 +525,22 @@ class MixtureDistributionClass:
         pred : pd.DataFrame
             Predictions.
         """
-        predt = torch.tensor(
-            booster.predict(data, raw_score=True),
-            dtype=torch.float32
-        ).reshape(-1, self.n_dist_param)
-
-        # Set init_score as starting point for each distributional parameter.
-        init_score_pred = torch.tensor(
-            np.ones(shape=(data.shape[0], 1))*start_values,
-            dtype=torch.float32
-        )
-
-        # The predictions don't include the init_score specified in creating the train data.
-        # Hence, it needs to be added manually with the corresponding transform for each distributional parameter.
-        dist_params_predt = torch.split(
-            torch.cat(
-                [
-                    predt[:, i].reshape(-1, 1) + init_score_pred[:, i].reshape(-1, 1)
-                    for i in range(self.n_dist_param)
-                ], axis=1
-            ), self.M, dim=1
-        )
-
-        dist_params_predt = np.concatenate(
-            [
-                response_fn(dist_params_predt[i]).numpy()
-                for i, response_fn in enumerate(self.param_dict.values())
-            ],
-            axis=1,
-        )
-
-        dist_params_predt = pd.DataFrame(dist_params_predt)
-        dist_params_predt.columns = self.distribution_arg_names
-
-        # Draw samples from predicted response distribution
-        pred_samples_df = self.draw_samples(predt_params=dist_params_predt,
-                                            n_samples=n_samples,
-                                            seed=seed)
+        dist_params_predt = self._predict_param_array(booster=booster,
+                                                      data=data,
+                                                      start_values=start_values)
 
         if pred_type == "parameters":
-            return dist_params_predt
+            return pd.DataFrame(dist_params_predt, columns=self.distribution_arg_names)
 
-        elif pred_type == "samples":
-            return pred_samples_df
+        pred_samples = self._draw_samples_array(predt_params=dist_params_predt,
+                                                n_samples=n_samples,
+                                                seed=seed)
+
+        if pred_type == "samples":
+            return _sample_array_to_frame(pred_samples, discrete=self.discrete)
 
         elif pred_type == "quantiles":
-            # Calculate quantiles from predicted response distribution
-            pred_quant_df = pred_samples_df.quantile(quantiles, axis=1).T
-            pred_quant_df.columns = [str("quant_") + str(quantiles[i]) for i in range(len(quantiles))]
-            if self.discrete:
-                pred_quant_df = pred_quant_df.astype(int)
-            return pred_quant_df
+            return _quantile_array_to_frame(pred_samples, quantiles, discrete=self.discrete)
 
     def compute_gradients_and_hessians(self,
                                        loss: torch.tensor,
@@ -584,35 +616,23 @@ class MixtureDistributionClass:
             Stabilized Gradient or Hessian.
         """
 
+        fill_val = float(torch.nanmean(input_der))
+        input_der = torch.nan_to_num(input_der, nan=fill_val, posinf=fill_val, neginf=fill_val)
+
         if type == "MAD":
-            input_der = torch.nan_to_num(input_der,
-                                         nan=float(torch.nanmean(input_der)),
-                                         posinf=float(torch.nanmean(input_der)),
-                                         neginf=float(torch.nanmean(input_der))
-                                         )
             div = torch.nanmedian(torch.abs(input_der - torch.nanmedian(input_der)))
-            div = torch.where(div < torch.tensor(1e-04), torch.tensor(1e-04), div)
-            stab_der = input_der / div
+            div = div.clamp(min=1e-04)
+            return input_der / div
 
         if type == "L2":
-            input_der = torch.nan_to_num(input_der,
-                                         nan=float(torch.nanmean(input_der)),
-                                         posinf=float(torch.nanmean(input_der)),
-                                         neginf=float(torch.nanmean(input_der))
-                                         )
             div = torch.sqrt(torch.nanmean(input_der.pow(2)))
-            div = torch.where(div < torch.tensor(1e-04), torch.tensor(1e-04), div)
-            div = torch.where(div > torch.tensor(10000.0), torch.tensor(10000.0), div)
-            stab_der = input_der / div
+            div = div.clamp(min=1e-04, max=10000.0)
+            return input_der / div
 
         if type == "None":
-            stab_der = torch.nan_to_num(input_der,
-                                        nan=float(torch.nanmean(input_der)),
-                                        posinf=float(torch.nanmean(input_der)),
-                                        neginf=float(torch.nanmean(input_der))
-                                        )
+            return input_der
 
-        return stab_der
+        raise ValueError("Invalid stabilization method. Select 'None', 'MAD', or 'L2'.")
 
     def dist_select(self,
                     target: np.ndarray,
@@ -620,6 +640,7 @@ class MixtureDistributionClass:
                     max_iter: int = 100,
                     plot: bool = False,
                     figure_size: tuple = (8, 5),
+                    n_jobs: int = 1,
                     ) -> pd.DataFrame:
         """
         Function that selects the most suitable distribution among the candidate_distributions for the target variable,
@@ -637,47 +658,33 @@ class MixtureDistributionClass:
             If True, a density plot of the actual and fitted distribution is created.
         figure_size: tuple
             Figure size of the density plot.
+        n_jobs: int
+            Number of parallel jobs used to fit candidate mixture distributions.
 
         Returns
         -------
         fit_df: pd.DataFrame
             Dataframe with the loss values of the fitted candidate distributions.
         """
-        dist_list = []
         total_iterations = len(candidate_distributions)
-        with tqdm(total=total_iterations, desc="Fitting candidate distributions") as pbar:
-            for i in range(len(candidate_distributions)):
-                dist_name = candidate_distributions[i].distribution.__class__.__name__
-                n_mix = candidate_distributions[i].M
-                tau = candidate_distributions[i].temperature
-                dist_name = f"Mixture({dist_name}, tau={tau}, M={n_mix})"
-                pbar.set_description(f"Fitting {dist_name} distribution")
-                try:
-                    loss, params = candidate_distributions[i].calculate_start_values(target=target, max_iter=max_iter)
-                    fit_df = pd.DataFrame.from_dict(
-                        {candidate_distributions[i].loss_fn: loss.reshape(-1, ),
-                         "distribution": str(dist_name),
-                         "params": [params],
-                         "dist_pos": i,
-                         "M": candidate_distributions[i].M
-                         }
-                    )
-                except Exception as e:
-                    warnings.warn(f"Error fitting {dist_name} distribution: {str(e)}")
-                    fit_df = pd.DataFrame(
-                        {candidate_distributions[i].loss_fn: np.nan,
-                         "distribution": str(dist_name),
-                         "params": [np.nan] * self.n_dist_param,
-                         "dist_pos": i,
-                         "M": candidate_distributions[i].M
-                         }
-                    )
-                dist_list.append(fit_df)
-                pbar.update(1)
-            pbar.set_description(f"Fitting of candidate distributions completed")
-            fit_df = pd.concat(dist_list).sort_values(by=candidate_distributions[i].loss_fn, ascending=True)
-            fit_df["rank"] = fit_df[candidate_distributions[i].loss_fn].rank().astype(int)
-            fit_df.set_index(fit_df["rank"], inplace=True)
+        if n_jobs == 1:
+            results = []
+            with tqdm(total=total_iterations, desc="Fitting candidate distributions") as pbar:
+                for i, candidate_distribution in enumerate(candidate_distributions):
+                    dist_name = _mixture_candidate_name(candidate_distribution)
+                    pbar.set_description(f"Fitting {dist_name} distribution")
+                    results.append(_fit_mixture_candidate(candidate_distribution, target, max_iter, i))
+                    pbar.update(1)
+                pbar.set_description("Fitting of candidate distributions completed")
+        else:
+            results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(_fit_mixture_candidate)(candidate_distribution, target, max_iter, i)
+                for i, candidate_distribution in enumerate(candidate_distributions)
+            )
+
+        fit_df = pd.DataFrame(results).sort_values(by=candidate_distributions[0].loss_fn, ascending=True)
+        fit_df["rank"] = fit_df[candidate_distributions[0].loss_fn].rank().astype(int)
+        fit_df.set_index(fit_df["rank"], inplace=True)
 
         if plot:
             from skbase.utils.dependencies import _check_soft_dependencies
