@@ -111,8 +111,8 @@ class TestClass:
         assert isinstance(lgblss.booster, lgb.Booster)
 
     @pytest.mark.skipif(
-        not _check_soft_dependencies(["optuna"], severity="none"),
-        reason="optuna is required to run this test."
+        not _check_soft_dependencies(["optuna", "optuna_integration"], severity="none"),
+        reason="optuna and optuna-integration are required to run this test."
     )
     def test_model_hpo(self, univariate_data, univariate_lgblss,):
         # Unpack
@@ -143,6 +143,58 @@ class TestClass:
 
         # Assertions
         assert isinstance(opt_param, dict)
+
+    @pytest.mark.skipif(
+        not _check_soft_dependencies(["optuna", "optuna_integration"], severity="none"),
+        reason="optuna and optuna-integration are required to run this test."
+    )
+    def test_model_hpo_grouped(self):
+        rng = np.random.default_rng(123)
+        groups = np.repeat(np.arange(8), 6)
+        X_train = pd.DataFrame({
+            "x0": rng.normal(size=len(groups)),
+            "x1": rng.normal(size=len(groups)),
+        })
+        y_train = 2.0 * X_train["x0"].to_numpy() - X_train["x1"].to_numpy() + rng.normal(size=len(groups))
+        dtrain = lgb.Dataset(X_train, label=y_train, params={"feature_pre_filter": False})
+        lgblss = LightGBMLSS(Gaussian())
+
+        folds = lgblss._resolve_cv_folds(dtrain, groups=groups, nfold=4)
+        assert len(folds) == 4
+        for train_idx, valid_idx in folds:
+            assert set(groups[train_idx]).isdisjoint(set(groups[valid_idx]))
+
+        manual_folds = [(np.arange(0, 24), np.arange(24, 48))]
+        resolved_manual = lgblss._resolve_cv_folds(dtrain, folds=manual_folds, groups=groups, nfold=4)
+        assert len(resolved_manual) == 1
+        assert np.array_equal(resolved_manual[0][0], manual_folds[0][0])
+        assert np.array_equal(resolved_manual[0][1], manual_folds[0][1])
+
+        param_dict = {
+            "eta": ["float", {"low": 0.05, "high": 0.2, "log": True}],
+            "max_depth": ["int", {"low": 1, "high": 2, "log": False}],
+            "feature_pre_filter": ["categorical", [False]],
+            "device_type": ["categorical", ["cpu"]],
+            "num_threads": ["categorical", [1]],
+            "verbosity": ["categorical", [-1]],
+        }
+
+        opt_param = lgblss.hyper_opt(
+            param_dict,
+            dtrain,
+            num_boost_round=5,
+            nfold=4,
+            groups=groups,
+            early_stopping_rounds=3,
+            max_minutes=1,
+            n_trials=2,
+            silence=True,
+            seed=123,
+            hp_seed=123,
+        )
+
+        assert isinstance(opt_param, dict)
+        assert isinstance(opt_param["opt_rounds"], int)
 
     def test_model_predict(self, univariate_data, univariate_lgblss, univariate_params):
         # Unpack

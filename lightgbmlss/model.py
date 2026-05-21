@@ -63,6 +63,45 @@ class LightGBMLSS:
         self.dist = dist             # Distribution object
         self.start_values = None     # Starting values for distributional parameters
 
+    @staticmethod
+    def _resolve_cv_folds(
+            train_set: Dataset,
+            folds: Optional[Union[Iterable[Tuple[np.ndarray, np.ndarray]], _LGBMBaseCrossValidator]] = None,
+            groups: Optional[Union[np.ndarray, pd.Series, List[Any]]] = None,
+            nfold: int = 5
+    ) -> Optional[Union[List[Tuple[np.ndarray, np.ndarray]], _LGBMBaseCrossValidator]]:
+        """Resolve grouped CV inputs into reusable LightGBM fold indices."""
+        if folds is not None and not hasattr(folds, "split"):
+            return list(folds)
+
+        if groups is None:
+            return folds
+
+        labels = train_set.get_label()
+        if labels is None:
+            raise ValueError("Grouped CV requires train_set labels.")
+
+        groups_arr = np.asarray(groups).reshape(-1)
+        n_samples = len(labels)
+        if len(groups_arr) != n_samples:
+            raise ValueError(
+                f"Grouped CV received {len(groups_arr)} groups for {n_samples} training rows."
+            )
+
+        X_idx = np.arange(n_samples)
+        if folds is None:
+            n_unique_groups = len(np.unique(groups_arr))
+            if n_unique_groups < nfold:
+                raise ValueError(
+                    f"Grouped CV requires at least nfold unique groups; got {n_unique_groups} groups and nfold={nfold}."
+                )
+            folds = GroupKFold(n_splits=nfold)
+
+        if not hasattr(folds, "split"):
+            raise ValueError("When groups are provided, folds must be None or a splitter object with a split method.")
+
+        return list(folds.split(X_idx, labels, groups_arr))
+
     def set_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """
         Set parameters for distributional model.
@@ -172,6 +211,7 @@ class LightGBMLSS:
            train_set: Dataset,
            num_boost_round: int = 100,
            folds: Optional[Union[Iterable[Tuple[np.ndarray, np.ndarray]], _LGBMBaseCrossValidator]] = None,
+           groups: Optional[Union[np.ndarray, pd.Series, List[Any]]] = None,
            nfold: int = 5,
            stratified: bool = True,
            shuffle: bool = True,
@@ -199,6 +239,10 @@ class LightGBMLSS:
             (https://scikit-learn.org/stable/modules/classes.html#splitter-classes)
             and have ``split`` method.
             This argument has highest priority over other data split arguments.
+        groups : array-like or None, optional (default=None)
+            Group labels used to construct grouped folds. If ``folds`` is None,
+            ``GroupKFold(n_splits=nfold)`` is used. If ``folds`` is a splitter
+            object, its ``split`` method receives these groups.
         nfold : int, optional (default=5)
             Number of folds in CV.
         stratified : bool, optional (default=True)
@@ -233,12 +277,13 @@ class LightGBMLSS:
         """
         self.set_params(params)
         self.set_init_score(train_set)
+        cv_folds = self._resolve_cv_folds(train_set, folds=folds, groups=groups, nfold=nfold)
 
         self.bstLSS_cv = lgb.cv(params,
                                 train_set,
                                 feval=self.dist.metric_fn,
                                 num_boost_round=num_boost_round,
-                                folds=folds,
+                                folds=cv_folds,
                                 nfold=nfold,
                                 stratified=False,
                                 shuffle=False,
@@ -258,6 +303,8 @@ class LightGBMLSS:
             train_set: lgb.Dataset,
             num_boost_round=500,
             nfold=10,
+            folds: Optional[Union[Iterable[Tuple[np.ndarray, np.ndarray]], _LGBMBaseCrossValidator]] = None,
+            groups: Optional[Union[np.ndarray, pd.Series, List[Any]]] = None,
             early_stopping_rounds=20,
             max_minutes=10,
             n_trials=None,
@@ -279,6 +326,12 @@ class LightGBMLSS:
             Number of boosting iterations.
         nfold: int
             Number of folds in CV.
+        folds : generator or iterator of (train_idx, test_idx) tuples, scikit-learn splitter object or None, optional (default=None)
+            Explicit CV folds or splitter to use during hyperparameter optimization.
+        groups : array-like or None, optional (default=None)
+            Group labels for grouped hyperparameter tuning. If ``folds`` is None,
+            ``GroupKFold(n_splits=nfold)`` is used. If ``folds`` is a splitter
+            object, its ``split`` method receives these groups.
         early_stopping_rounds: int
             Activates early stopping. Cross-Validation metric (average of validation
             metric computed over CV folds) needs to improve at least once in
@@ -312,11 +365,12 @@ class LightGBMLSS:
             "Installing via pip install lightgbmlss[all_extras] also installs "
             "the required dependencies."
         )
-        _check_soft_dependencies(["optuna"], msg=msg)
+        _check_soft_dependencies(["optuna", "optuna_integration"], msg=msg)
 
         import optuna
         from optuna.samplers import TPESampler
         from optuna.integration import LightGBMPruningCallback
+        cv_folds = self._resolve_cv_folds(train_set, folds=folds, groups=groups, nfold=nfold)
 
         def objective(trial):
 
@@ -366,6 +420,7 @@ class LightGBMLSS:
             lgblss_param_tuning = self.cv(hyper_params,
                                           train_set,
                                           num_boost_round=num_boost_round,
+                                          folds=cv_folds,
                                           nfold=nfold,
                                           callbacks=[pruning_callback, early_stopping_callback],
                                           seed=seed,
